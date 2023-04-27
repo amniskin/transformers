@@ -4,21 +4,72 @@ import jax.numpy as jnp
 from typing import Callable, Sequence
 
 
+def sin_pos_enc(sequence_length, embed_dim):
+    chex.assert_is_divisible(embed_dim, 2)
+    X = jnp.expand_dims(jnp.arange(sequence_length), 1) / \
+        jnp.power(10000, jnp.arange(embed_dim, step=2) / embed_dim)
+    out = jnp.empty((sequence_length, embed_dim))
+    out = out.at[:, 0::2].set(jnp.sin(X))
+    out = out.at[:, 1::2].set(jnp.cos(X))
+    return out
+
+
+def lens2mask(lens, max_val, ndim):
+    """create mask from lengths
+
+    Example
+    =======
+    >>> x = lens2mask(jnp.array([3, 5]), 7, 3)
+    >>> x.shape
+    (2, 1, 7)
+    >>> x[0, 0].astype(jnp.int32).tolist()
+    [0, 0, 0, 1, 1, 1, 1]
+    """
+    mask = jnp.repeat(jnp.expand_dims(jnp.arange(max_val), 0),
+                      lens.shape[0], 0)
+    mask = mask >= jnp.expand_dims(lens, 1)
+    mask = jnp.expand_dims(mask, range(1, ndim - mask.ndim + 1))
+    return mask
+
+
+def causal_mask(shape):
+    """make a causal mask of a given shape
+
+    Example
+    =======
+    >>> x = causal_mask((2, 3, 3))
+    >>> x.shape
+    (2, 3, 3)
+    >>> all(all(~jnp.diag(y)) for y in x)
+    True
+    >>> all(all(jnp.diag(y, 1)) for y in x)
+    True
+    >>> all(all(~jnp.diag(y, -1)) for y in x)
+    True
+    """
+    return jnp.triu(jnp.ones(shape, dtype=jnp.bool_), k=1)
+
+
 def masked_softmax(args, mask):
-    "mask is [0, 1] -- 1 for keeps, 0 for nots"
+    """mask is [0, 1] -- 0 for keeps, 1 for nots
+
+    Example
+    =======
+    >>> args = jnp.arange(2*3*5).reshape((2, 3, 5)).astype(jnp.float32)
+    >>> lens = jnp.array([3, 2])
+    >>> mask = lens2mask(lens, 5, 3)
+    >>> masked = masked_softmax(args, mask)
+    >>> (masked[0, :, 3:] == 0).all().item()
+    True
+    >>> (masked[0, :, :3] > 0).all().item()
+    True
+    >>> (masked[1, :, 2:] == 0).all().item()
+    True
+    >>> (masked[1, :, :2] > 0).all().item()
+    True
+    """
     if mask is not None:
-        chex.assert_shape(mask, (args.shape[0],))
-        mask = jnp.expand_dims(mask, 1)
-        mask = jnp.broadcast_to(jnp.arange(args.shape[-2]),
-                                (args.shape[0], args.shape[-2])) < mask
-        mask = (1 - mask) * -10_000
-        if args.ndim == 4:
-            mask = jnp.expand_dims(mask, (1, -1))
-        elif args.ndim == 3:
-            mask = jnp.expand_dims(mask, (-1,))
-        else:
-            raise NotImplementedError('only dims 3 or 4 are implemented')
-        args += mask
+        args = args + (mask.astype(args.dtype) * -10_000.0)
     return nn.softmax(args)
 
 
@@ -60,7 +111,8 @@ class MultiHeadAttention(nn.Module):
     ...                          n_heads=7, size_per_head=13)
     >>> q = jnp.ones((2, 5, 7 * 11))
     >>> kv = jnp.ones((2, 3, 7 * 11))
-    >>> mask = jran.randint(rng, (2,), 0, 5)
+    >>> mask = jran.randint(rng, (2,), 0, 3)
+    >>> mask = lens2mask(mask, 3, 4)
     >>> rng, now_rng = jran.split(rng)
     >>> params = mdl.init(now_rng, q, kv, kv)
     >>> rng, now_rng = jran.split(rng)
@@ -78,26 +130,18 @@ class MultiHeadAttention(nn.Module):
 
     @nn.compact
     def __call__(self, q, k, v, mask=None, training=False):
+        # helpful nomenclature
+        # H : number of heads
         # B : batch_size
         # N : input sequence length
         # M : output sequence length
         # D : size of embeddings
-
-        # helpful nomenclature
-        # H : number of heads
-
-        # q (B, N, D)
-        # k (B, M, D)
-        # v (B, M, D)
-        # m (B, M) or None
         B, N, D = q.shape
         M = k.shape[1]
         chex.assert_shape(q, (B, N, D))
         chex.assert_shape(k, (B, M, D))
         chex.assert_shape(v, (B, M, D))
         _shape = (B, -1, self.n_heads, self.size_per_head)
-        if mask is not None:
-            chex.assert_shape(mask, (B,))
 
         def qkv_layer(x, name):
             x = nn.Dense(self.n_heads * self.size_per_head, name=name)(x)
@@ -136,7 +180,7 @@ class FeedForward(nn.Module):
     def __call__(self, X):
         D = X.shape[-1]
         X = nn.Dense(self.hidden_dim)(X)
-        X = nn.relu(X)
+        X = nn.celu(X)
         X = nn.Dense(D)(X)
         return X
 
@@ -166,16 +210,6 @@ class EncoderLayer(nn.Module):
         return X
 
 
-def sin_pos_enc(sequence_length, embed_dim):
-    chex.assert_is_divisible(embed_dim, 2)
-    X = jnp.expand_dims(jnp.arange(sequence_length), 1) / \
-        jnp.power(10000, jnp.arange(embed_dim, step=2) / embed_dim)
-    out = jnp.empty((sequence_length, embed_dim))
-    out = out.at[:, 0::2].set(jnp.sin(X))
-    out = out.at[:, 1::2].set(jnp.cos(X))
-    return out
-
-
 class Encoder(nn.Module):
     """The transformer encoder network
 
@@ -194,13 +228,13 @@ class Encoder(nn.Module):
     ...               layers=[layer() for _ in range(3)])
     >>> rng = jran.PRNGKey(0)
     >>> rng, now_rng = jran.split(rng)
-    >>> a = jran.randint(rng, (2, 5), 0, mdl.vocab_size)
+    >>> qkv = jran.randint(rng, (2, 5), 0, mdl.vocab_size)
     >>> rng, now_rng = jran.split(rng)
     >>> mask = jran.randint(now_rng, (2,), 0, 5)
     >>> rng, now_rng = jran.split(rng)
-    >>> params = mdl.init(now_rng, a)
+    >>> params = mdl.init(now_rng, qkv)
     >>> rng, now_rng = jran.split(rng)
-    >>> resp, state = mdl.apply(params, a, mask=mask, training=True,
+    >>> resp, state = mdl.apply(params, qkv, mask=mask, training=True,
     ...                         mutable=['intermediates'],
     ...                         rngs={'dropout': now_rng})
     >>> resp.shape
@@ -213,7 +247,11 @@ class Encoder(nn.Module):
 
     @nn.compact
     def __call__(self, X, mask=None, training=False):
-        X = nn.Embed(self.vocab_size, self.embed_dim)(X)
+        B, N = X.shape[:2]
+        if mask is not None:
+            chex.assert_shape(mask, (B,))
+            mask = lens2mask(mask, N, 4)
+        X = nn.Embed(self.vocab_size, self.embed_dim, name='embed')(X)
         X = X * jnp.sqrt(self.embed_dim)
         # X.shape[-2] is the sequence length
         X = X + self.pos_encoding(X.shape[-2], self.embed_dim)
@@ -232,17 +270,17 @@ class DecoderLayer(nn.Module):
     ...                    n_heads=2, size_per_head=5, add_norm_eps=1e-6)
     >>> rng = jran.PRNGKey(0)
     >>> rng, now_rng = jran.split(rng)
-    >>> X = jran.uniform(rng, (2, 5, 2 * 7))
+    >>> q = jran.uniform(rng, (2, 5, 2 * 7))
+    >>> rng, now_rng = jran.split(rng)
+    >>> kv = jran.uniform(rng, (2, 3, 2 * 7))
     >>> rng, now_rng = jran.split(rng)
     >>> enc_mask = jran.randint(now_rng, (2,), 0, 5)
+    >>> enc_mask = lens2mask(enc_mask, 5, 4)
+    >>> dec_mask = None
     >>> rng, now_rng = jran.split(rng)
-    >>> Y = jran.uniform(rng, (2, 3, 2 * 7))
+    >>> params = mdl.init(now_rng, q, kv, enc_mask, dec_mask)
     >>> rng, now_rng = jran.split(rng)
-    >>> dec_mask = jran.randint(now_rng, (2,), 0, 3)
-    >>> rng, now_rng = jran.split(rng)
-    >>> params = mdl.init(now_rng, X, Y, enc_mask, dec_mask)
-    >>> rng, now_rng = jran.split(rng)
-    >>> resp, state = mdl.apply(params, X, Y, enc_mask, dec_mask,
+    >>> resp, state = mdl.apply(params, q, kv, enc_mask, dec_mask,
     ...                         training=True,
     ...                         mutable=['intermediates'],
     ...                         rngs={'dropout': now_rng})
@@ -259,6 +297,7 @@ class DecoderLayer(nn.Module):
 
     @nn.compact
     def __call__(self, X, Y, enc_mask, dec_mask, training=False):
+
         def attn(q, kv, mask, training, name):
             mdl = MultiHeadAttention(n_heads=self.n_heads,
                                      size_per_head=self.size_per_head,
@@ -293,17 +332,17 @@ class Decoder(nn.Module):
     ...               layers=[layer() for i in range(3)])
     >>> rng = jran.PRNGKey(0)
     >>> rng, now_rng = jran.split(rng)
-    >>> X = jran.uniform(now_rng, (2, 5, mdl.embed_dim))
+    >>> q = jran.uniform(now_rng, (2, 5, mdl.embed_dim))
     >>> rng, now_rng = jran.split(rng)
     >>> enc_mask = jran.randint(now_rng, (2,), 0, 5)
     >>> rng, now_rng = jran.split(rng)
-    >>> Y = jran.randint(rng, (2, 3), 0, mdl.vocab_size)
+    >>> kv = jran.randint(rng, (2, 3), 0, mdl.vocab_size)
     >>> rng, now_rng = jran.split(rng)
     >>> dec_mask = jran.randint(now_rng, (2,), 0, 3)
     >>> rng, now_rng = jran.split(rng)
-    >>> params = mdl.init(now_rng, X, Y, enc_mask, dec_mask)
+    >>> params = mdl.init(now_rng, q, kv, enc_mask, dec_mask)
     >>> rng, now_rng = jran.split(rng)
-    >>> resp, state = mdl.apply(params, X, Y, enc_mask, dec_mask,
+    >>> resp, state = mdl.apply(params, q, kv, enc_mask, dec_mask,
     ...                         training=True,
     ...                         mutable=['intermediates'],
     ...                         rngs={'dropout': now_rng})
@@ -317,14 +356,24 @@ class Decoder(nn.Module):
 
     @nn.compact
     def __call__(self, X, Y, enc_mask, dec_mask, training=False):
-        Y = nn.Embed(self.vocab_size, self.embed_dim)(Y)
+        B, N = Y.shape[:2]
+        if enc_mask is not None:
+            chex.assert_shape(enc_mask, (B,))
+            enc_mask = lens2mask(enc_mask, X.shape[1], 4)
+        if dec_mask is None:
+            dec_mask = False
+        else:
+            dec_mask = lens2mask(dec_mask, N, 4)
+        dec_mask = causal_mask((1, 1, N, N)) | dec_mask
+        # print('dec_mask.shape ==', dec_mask.shape)
+        Y = nn.Embed(self.vocab_size, self.embed_dim, name='embed')(Y)
         Y = Y * jnp.sqrt(self.embed_dim)
         # X.shape[-2] is the sequence length
         Y = Y + self.pos_encoding(Y.shape[-2], self.embed_dim)
         for i, layer in enumerate(self.layers):
             Y = layer(X, Y, enc_mask, dec_mask, training=training)
         Y = nn.Dense(self.vocab_size, name='final')(Y)
-        Y = nn.softmax(Y)
+        # Y = nn.softmax(Y)
         return Y
 
 
