@@ -28,7 +28,9 @@ dependencies = [
   "flax",
   "optax",
   "chex",
-  "clu"
+  "clu",
+  "tqdm",
+  "mlflow[extras]"
 ]
 dynamic = ["version"]
 
