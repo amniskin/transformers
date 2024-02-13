@@ -24,13 +24,22 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
+  "altair",
+  "vega_datasets",
   "jax[cpu]",
   "flax",
   "optax",
   "chex",
   "clu",
   "tqdm",
-  "mlflow[extras]"
+  "mlflow[extras]",
+  "ipykernel",
+  "matplotlib",
+  "seaborn",
+  "pandas",
+  "jupyterlab",
+  "ipywidgets",
+  "jupyter_contrib_nbextensions",
 ]
 dynamic = ["version"]
 
@@ -44,3 +53,6 @@ path = "src/reproductions/__about__.py"
 
 [tool.hatch.envs.default]
 python = "310"
+
+[project.entry-points."nbconvert.exporters"]
+blog = "reproductions.nb_export:BlogExporter"
